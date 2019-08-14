@@ -11,6 +11,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"sync"
 )
 
 func downloadFile(filepath, url string) (string, error) {
@@ -35,10 +36,76 @@ func downloadFile(filepath, url string) (string, error) {
 	return hex.EncodeToString(checksum.Sum(nil)), nil
 }
 
+type chunk struct {
+	cacheFile      string
+	finalFile      string
+	url            string
+	expectedDigest string
+}
+
+func (d *downloader) readChunk(ch chan chunk) {
+	defer d.wg.Done()
+	for {
+		data, ok := <-ch
+		if !ok {
+			break
+		}
+
+		fmt.Printf("Downloading %s to %s\n", data.url, data.cacheFile)
+
+		// TODO: parallelise big files to chunks?
+		partFile := fmt.Sprintf("%s.%d", data.cacheFile, rand.Int())
+		digest, err := downloadFile(partFile, data.url)
+		if err != nil {
+			panic(err)
+		}
+		if digest != data.expectedDigest {
+			panic(fmt.Errorf("Mismatching digest: Downloaded %s, sha256 was %s", data.url, digest))
+		}
+		err = os.Rename(partFile, data.cacheFile)
+		if err != nil {
+			panic(err)
+		}
+		err = makeHardlink(data.cacheFile, data.finalFile)
+		if err != nil {
+			panic(err)
+		}
+	}
+}
+
+type downloader struct {
+	wg          sync.WaitGroup
+	cachePath   string
+	concurrency int
+}
+
+func makeHardlink(cacheFile, finalFile string) error {
+	err := os.MkdirAll(path.Dir(finalFile), 0755)
+	if err != nil {
+		return err
+	}
+	err = os.Link(cacheFile, finalFile)
+	if err != nil && !os.IsExist(err) {
+		return err
+	}
+	return nil
+}
+
+type Downloader interface {
+	Download(downloadWorkload, server, outputDirectory string) error
+}
+
+func NewDownloader(cachePath string, concurrency int) Downloader {
+	return &downloader{
+		cachePath:   cachePath,
+		concurrency: concurrency,
+	}
+}
+
 // Download downloads files from server and writes to outputDirectory, looking
 // up and adding to cachePath as needed.
-func Download(downloadWorkload, server, cachePath, outputDirectory string) error {
-	os.MkdirAll(cachePath, 0755)
+func (d *downloader) Download(downloadWorkload, server, outputDirectory string) error {
+	os.MkdirAll(d.cachePath, 0755)
 	file, err := os.Open(downloadWorkload)
 	if err != nil {
 		return err
@@ -46,38 +113,30 @@ func Download(downloadWorkload, server, cachePath, outputDirectory string) error
 	defer file.Close()
 
 	scanner := bufio.NewScanner(file)
-	// TODO: Parallelise over files, parallelise big files to chunks.
+	ch := make(chan chunk, d.concurrency)
+	for i := 0; i < d.concurrency; i++ {
+		d.wg.Add(1)
+		go d.readChunk(ch)
+	}
+
 	for scanner.Scan() {
 		words := strings.Fields(scanner.Text())
-		cacheFile := path.Join(cachePath, words[0])
+		cacheFile := path.Join(d.cachePath, words[0])
+		finalFile := path.Join(outputDirectory, words[1])
 		if _, err := os.Stat(cacheFile); os.IsNotExist(err) {
-			partFile := fmt.Sprintf("%s.%d", cacheFile, rand.Int())
 			url := server + words[0]
-			fmt.Printf("Downloading %s to %s\n", url, words[1])
-			digest, err := downloadFile(partFile, url)
-			if err != nil {
-				return err
-			}
-			if digest != words[0] {
-				return fmt.Errorf("Mismatching digest: Downloaded %s, sha256 was %s", url, digest)
-			}
-			err = os.Rename(partFile, cacheFile)
-			if err != nil {
-				return err
-			}
+			ch <- chunk{cacheFile: cacheFile, url: url, expectedDigest: words[0], finalFile: finalFile}
 		} else if err != nil {
 			return err
-		}
-		finalFile := path.Join(outputDirectory, words[1])
-		err = os.MkdirAll(path.Dir(finalFile), 0755)
-		if err != nil {
-			return err
-		}
-		err = os.Link(cacheFile, finalFile)
-		if err != nil && !os.IsExist(err) {
-			return err
+		} else {
+			err = makeHardlink(cacheFile, finalFile)
+			if err != nil {
+				return err
+			}
 		}
 	}
+	close(ch)
+	d.wg.Wait()
 
 	return scanner.Err()
 }

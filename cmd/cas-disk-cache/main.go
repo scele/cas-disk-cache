@@ -13,6 +13,7 @@ type args struct {
 	Server           string `short:"s" long:"server" description:"Prefix where to download missing blobs" required:"true"`
 	CachePath        string `short:"c" long:"cache-dir" description:"Local cache CAS directory" required:"true"`
 	OutputDirectory  string `short:"o" long:"output-dir" description:"Output directory" default:"."`
+	Concurrency  int `short:"j" long:"concurrency" description:"Download concurrency" default:"16"`
 }
 
 func main() {
@@ -27,7 +28,8 @@ func main() {
 			os.Exit(1)
 		}
 	}
-	err = pkg.Download(args.DownloadWorkload, args.Server, args.CachePath, args.OutputDirectory)
+	dl := pkg.NewDownloader(args.CachePath, args.Concurrency)
+	err = dl.Download(args.DownloadWorkload, args.Server, args.OutputDirectory)
 	if err != nil {
 		fmt.Printf("%v\n", err)
 		os.Exit(1)
